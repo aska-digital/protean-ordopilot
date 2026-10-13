@@ -289,6 +289,8 @@ class SessionCatalog:
             for s in (slug_a, slug_b):
                 if s not in data["sessions"]:
                     raise KeyError("unknown session slug: %s" % s)
+            if into in data["sessions"] and into not in (slug_a, slug_b):
+                raise ConflictError("target slug exists: %s" % into)
             a, b = data["sessions"][slug_a], data["sessions"][slug_b]
             if holder is not None:
                 for ref in (a, b):
@@ -304,9 +306,9 @@ class SessionCatalog:
                    "seat_expires_utc": None, "seat_epoch": 0,
                    "summary": merged_summary, "updated_rev": 1,
                    "paused": False, "merged_from": [slug_a, slug_b]}
-            data["sessions"][into] = ref
             for s in (slug_a, slug_b):
                 data["sessions"].pop(s, None)
+            data["sessions"][into] = ref
             data["events"].append({"type": "sessions-merged",
                                    "from": [slug_a, slug_b], "into": into,
                                    "session_id": ref["session_id"],
