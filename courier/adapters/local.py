@@ -6,10 +6,14 @@ so dispatcher fallback paths are testable without network.
 
 import uuid
 
-from .base import SessionBackend  # noqa: F401
+from .base import DeliveryRejected, SessionBackend  # noqa: F401
 
 
 class BackendError(Exception):
+    pass
+
+
+class BackendRejected(DeliveryRejected, BackendError):
     pass
 
 
@@ -53,13 +57,13 @@ class LocalBackend:
         if self.fail_next is not None:
             err = self.fail_next
             self.fail_next = None
-            raise BackendError(err)
+            raise BackendRejected(err)
 
     def append_message(self, session_id, message):
         self._maybe_fail()
         target = self.get_session(session_id)
         if target is None:
-            raise BackendError("unknown session: %s" % session_id)
+            raise BackendRejected("unknown session: %s" % session_id)
         self.sessions[target["slug"]]["messages"].append(message)
         self.appended.append((target["session_id"],
                               message.get("message_id")))
@@ -69,6 +73,6 @@ class LocalBackend:
         self._maybe_fail()
         target = self.get_session(session_id)
         if target is None:
-            raise BackendError("unknown session: %s" % session_id)
+            raise BackendRejected("unknown session: %s" % session_id)
         return {"ok": True, "session_id": target["session_id"],
                 "prompt_chars": len(prompt)}

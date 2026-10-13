@@ -25,7 +25,9 @@ never forks it.
   CAS on integer revision; one writer seat per session with TTL, expiry
   takeover + epoch bump, explicit --steal recorded.
 - `courier/ledger.py` — SQLite + JSONL mirror; idempotency key
-  sha256(canonical_hash + "|" + target); duplicate -> drop-and-ack.
+  sha256(canonical_hash + "|" + catalog target); confirmed delivery -> duplicate
+  acknowledgement. Persisted attempts distinguish rejection from unknown
+  outcomes; per-key POSIX locks serialize side effects. See [delivery recovery](delivery-recovery.md).
 - `courier/compactor.py` — pointer-based HandoffRecord within 2000 chars,
   newest-first, truncated flag.
 - `courier/dispatcher.py` — approval gate first, then depth/paused/seat,

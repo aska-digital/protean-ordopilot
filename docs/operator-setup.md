@@ -128,7 +128,7 @@ Gateway middleware is NOT applicable (only tool/llm kinds; no inbound-message ki
 - Embedding cosine over summaries exists only if configured. Default v0.1 path is keyword matching. No embeddings by default.
 - Confidence floor 0.65; top-2 margin under 0.10 means ambiguous bucket, never a guess. Escalation ladder is fixed: small router (8s budget) → one retry into the ambiguous bucket → main-model decide → user clarification with the top-2 slugs. Every step records provider+model, never secrets.
 - Loop prevention: `route_depth` per message chain, max 4; overflow forces `ESCALATE` with reason `route-depth-overflow`.
-- Delivery ledger: JSONL + SQLite, idempotency key `sha256(canonical_message_hash + "|" + target_session_id)`; duplicate key means drop-and-ack, never redeliver. Payload column holds the canonical hash only, never text.
+- Delivery ledger: JSONL + SQLite, idempotency key `sha256(canonical_message_hash + "|" + target_session_id)`; only confirmed delivered keys return duplicate acknowledgements. Rejected and uncertain attempts require [explicit recovery](delivery-recovery.md). SQLite is authoritative; JSONL mirrors state transitions. Records retain hashes and opaque reference hashes, never message text or adapter exception contents.
 - Catalog writes use CAS on integer `revision`; stale `expected_rev` means exit 3, one retry, then escalate — never silent overwrite. One writer seat per session; busy seats park, expired seats allow takeover with epoch bump, live seats refuse unless explicit `--steal` (recorded).
 
 STABLE
