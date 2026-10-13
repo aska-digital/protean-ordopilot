@@ -6,11 +6,14 @@ never force.
 """
 
 from datetime import datetime, timezone
+import hashlib
+import json
 
 from . import MAX_ROUTE_DEPTH, SEAT_TTL_S
 from . import approvals as approvals_mod
+from .adapters.base import DeliveryEvidence, DeliveryRejected
 from .catalog import SeatError
-from .intake import utcnow_rfc3339
+from .intake import canonical_hash, utcnow_rfc3339
 from .ledger import idempotency_key
 
 
@@ -25,7 +28,7 @@ def _parse_ts(ts):
 
 
 def dispatch(message, decision, catalog, ledger, backend, holder="courier",
-             record_steps=None):
+             record_steps=None, _recovery=None):
     """Returns result dict with result in {delivered, duplicate-ack,
     held-for-approval, escalated, parked-busy, parked-clarification}."""
     ts = utcnow_rfc3339()
@@ -51,6 +54,17 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
         return {**base, "result": "escalated",
                 "reason": "route-depth-overflow",
                 "target_session_id": decision.get("target_session_id")}
+
+    if _recovery is not None:
+        original = ledger.get(_recovery["delivery_key"])
+        recovery_target = decision.get("target_session_id")
+        if (original is None or
+                original.get("canonical_hash") != message["canonical_hash"] or
+                (original.get("delivery_payload_hash") is not None and
+                 original["delivery_payload_hash"] != canonical_hash(message["text"])) or
+                original.get("target_session_id") != recovery_target or
+                idempotency_key(message["canonical_hash"], recovery_target) != _recovery["delivery_key"]):
+            raise ValueError("recovery requires the original canonical hash, catalog target and delivery key")
 
     kind = decision["kind"]
     if kind == "ESCALATE":
@@ -140,49 +154,140 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
                 "reason": "seat-unavailable",
                 "target_session_id": target_id}
 
-    # 5. Ledger idempotency before any side effect.
+    # 5. Serialize each key before persisting an attempt and calling the backend.
     key = idempotency_key(message["canonical_hash"], target_id)
-    existing = ledger.get(key)
-    if existing is not None:
-        return {**base, "result": "duplicate-ack",
-                "reason": "duplicate idempotency key; original returned",
+    with ledger.delivery_lock(key):
+        existing = ledger.get(key)
+        if existing is not None and existing["delivery_state"] == "attempting":
+            # Previous owner crashed or its commit failed. Absence of an ack
+            # proves nothing about the external side effect.
+            existing = ledger.transition(key, "unknown", reason="interrupted-attempt")
+        if existing is not None and existing["delivery_state"] == "delivered":
+            return {**base, "result": "duplicate-ack",
+                    "reason": "confirmed delivery already recorded",
+                    "target_session_id": target_id,
+                    "idempotency_key": key, "original": existing}
+
+        transport_id = session.get("backend_session_id") or deliver_id
+        if existing is not None:
+            transport_id = existing.get("transport_session_id", transport_id)
+            if _recovery is None:
+                return _unresolved(base, target_id, key, existing)
+            if existing["delivery_state"] == "unknown":
+                existing = _resolve_unknown(key, transport_id, ledger, backend,
+                                            _recovery)
+                if existing["delivery_state"] == "delivered":
+                    return {**base, "result": "duplicate-ack",
+                            "target_session_id": target_id,
+                            "idempotency_key": key, "original": existing,
+                            "reason": "delivery confirmed by recovery evidence"}
+                if existing["delivery_state"] != "rejected" and not _durable(backend):
+                    return _unresolved(base, target_id, key, existing)
+            ledger.transition(key, "attempting", reason="recovery-attempt",
+                              attempt=existing.get("attempt", 1) + 1)
+        else:
+            ledger.record({
+                "idempotency_key": key,
+                "message_id": message["message_id"],
+                "canonical_hash": message["canonical_hash"],
+                "delivery_payload_hash": canonical_hash(message["text"]),
                 "target_session_id": target_id,
-                "idempotency_key": key, "original": existing}
+                "transport_session_id": transport_id,
+                "decision_kind": kind,
+                "provider": decision.get("provider"),
+                "model": decision.get("model"),
+                "delivery_state": "attempting", "attempt": 1,
+                "result": "escalated"})
 
-    # 6. Deliver via backend; typed backend errors => provider-fallback mark.
-    try:
-        backend.append_message(deliver_id if kind == "NEW" else target_id,
-                               message)
-    except Exception as e:  # noqa: BLE001 — adapter raises typed errors
-        status, stored = ledger.record({
-            "idempotency_key": key,
-            "message_id": message["message_id"],
-            "canonical_hash": message["canonical_hash"],
-            "target_session_id": target_id,
-            "decision_kind": kind,
-            "provider": decision.get("provider"),
-            "model": decision.get("model"),
-            "result": "escalated",
-            "reason": "provider-fallback: %s" % e})
-        return {**base, "result": "escalated",
-                "reason": "provider-fallback: %s" % e,
-                "target_session_id": target_id, "idempotency_key": key}
+        # 6. Unmodified adapters remain valid; only opted-in durable adapters
+        # receive keys and may safely replay an uncertain attempt.
+        try:
+            if _durable(backend):
+                evidence = backend.append_delivery(transport_id, message, key)
+                state, metadata = _evidence(evidence)
+            else:
+                receipt = backend.append_message(transport_id, message)
+                # Existing adapter success means confirmed completion; an
+                # explicit unsuccessful/missing receipt remains uncertain.
+                state = "delivered" if isinstance(receipt, dict) and receipt.get("ok") is True else "unknown"
+                metadata = {"receipt_hash": _reference_hash(receipt),
+                            "confirmation_source": "adapter-return"} if state == "delivered" else {}
+        except DeliveryRejected:
+            state, metadata = "rejected", {}
+        except Exception:  # noqa: BLE001 — timeout/error text may contain secrets
+            state, metadata = "unknown", {}
+        stored = ledger.transition(key, state, reason="backend-" + state, **metadata)
+        if state != "delivered":
+            return _unresolved(base, target_id, key, stored)
+        out = {**base, "result": "delivered", "target_session_id": target_id,
+               "idempotency_key": key, "delivery_state": state}
+        if record_steps is not None:
+            out["steps"] = record_steps
+        return out
 
-    status, stored = ledger.record({
-        "idempotency_key": key,
-        "message_id": message["message_id"],
-        "canonical_hash": message["canonical_hash"],
-        "target_session_id": target_id,
-        "decision_kind": kind,
-        "provider": decision.get("provider"),
-        "model": decision.get("model"),
-        "result": "delivered"})
-    out = {**base, "result": "delivered" if status == "inserted"
-           else "duplicate-ack",
-           "target_session_id": target_id, "idempotency_key": key}
-    if record_steps is not None:
-        out["steps"] = record_steps
-    return out
+
+def recover_delivery(message, decision, catalog, ledger, backend,
+                     holder="courier", *, delivery_key, resolution=None, evidence_id=None):
+    """Explicit recovery; approval/route/seat gates run before any recovery.
+
+    Confirmed rejection can retry. Unknown outcomes require a durable adapter
+    or evidence-bearing operator resolution: delivered or rejected. A rejected
+    resolution asserts no external side effect; it authorizes a new attempt.
+    The caller is responsible for validating operator evidence. Only its hash
+    is retained. Never use this API to infer rejection from missing logs.
+    """
+    if resolution not in (None, "delivered", "rejected"):
+        raise ValueError("resolution must be delivered or rejected")
+    if resolution is not None and (not isinstance(evidence_id, str) or not evidence_id.strip()):
+        raise ValueError("operator resolution requires an evidence reference")
+    return dispatch(message, decision, catalog, ledger, backend, holder=holder,
+                    _recovery={"delivery_key": delivery_key, "resolution": resolution,
+                               "evidence_id": evidence_id})
+
+
+def _reference_hash(reference):
+    return hashlib.sha256(json.dumps(reference, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _durable(backend):
+    return (getattr(backend, "durable_delivery_keys", False) is True and
+            callable(getattr(backend, "append_delivery", None)) and
+            callable(getattr(backend, "lookup_delivery", None)))
+
+
+def _evidence(evidence):
+    if not isinstance(evidence, DeliveryEvidence):
+        return "unknown", {}
+    if evidence.outcome == "delivered" and isinstance(evidence.receipt_id, str) and evidence.receipt_id.strip():
+        return "delivered", {"receipt_hash": _reference_hash(evidence.receipt_id),
+                             "confirmation_source": "durable-backend"}
+    if evidence.outcome == "rejected" and isinstance(evidence.evidence_id, str) and evidence.evidence_id.strip():
+        return "rejected", {"evidence_hash": _reference_hash(evidence.evidence_id),
+                            "confirmation_source": "durable-backend"}
+    return "unknown", {}
+
+
+def _resolve_unknown(key, transport_id, ledger, backend, recovery):
+    resolution = recovery.get("resolution")
+    if resolution is not None:
+        return ledger.transition(key, resolution, reason="operator-resolution",
+                                 evidence_hash=_reference_hash(recovery["evidence_id"]),
+                                 confirmation_source="operator-assertion")
+    if _durable(backend):
+        try:
+            state, metadata = _evidence(backend.lookup_delivery(transport_id, key))
+        except Exception:  # noqa: BLE001
+            state, metadata = "unknown", {}
+        return ledger.transition(key, state, reason="backend-reconciliation", **metadata)
+    return ledger.get(key)
+
+
+def _unresolved(base, target_id, key, record):
+    return {**base, "result": "escalated",
+            "reason": "delivery-%s: explicit recovery required" % record["delivery_state"],
+            "delivery_state": record["delivery_state"],
+            "target_session_id": target_id, "idempotency_key": key,
+            "original": record}
 
 
 def _session_busy(session, ledger):

@@ -40,7 +40,7 @@ Spec: `docs/architecture.md` (module map, data contracts, escalation ladder, key
 
 ## Status (honest)
 
-Works in v0.1: intake → redact → router → dispatcher → catalog projection → ledger → approvals → compactor → policy → CLI verbs (`topics`, `show`, `correct`, `merge`, `split`, `pause`/`resume`, `forget`, `approvals`, `doctor`). Keyword topic matching over short summaries. CAS-guarded writes. Idempotent delivery. Fixed escalation ladder.
+Works in v0.1: intake → redact → router → dispatcher → catalog projection → ledger → approvals → compactor → policy → CLI verbs (`topics`, `show`, `correct`, `merge`, `split`, `pause`/`resume`, `forget`, `approvals`, `doctor`). Keyword topic matching over short summaries. CAS-guarded writes. Delivery acknowledgement for confirmed results and [explicit recovery](docs/delivery-recovery.md) for rejected or uncertain attempts. Fixed escalation ladder.
 
 Later, not in v0.1: dashboard UI, auto topic-learning, embedding tier by default, ledger history compaction. UNKNOWN (unverified, do not rely on): per-channel profile binding, free-tier Portal path, concurrent-resume locking, sessions REST/SDK surface, hook latency budget, CLI-local hook firing, adapter binding choice, free-tier allowlist, embedding provider, clarification UX shape.
 
