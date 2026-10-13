@@ -59,7 +59,7 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
                 "target_session_id": decision.get("target_session_id")}
 
     target_id = decision.get("target_session_id")
-    deliver_id = target_id
+    backend_session_id = None
     if kind == "NEW":
         # Materialize the fresh session behind the scenes unless the
         # decision already names a live one.
@@ -68,7 +68,6 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
             live = catalog.get(decision["target_slug"])
         if live is not None:
             target_id = live["session_id"]
-            deliver_id = target_id
             decision = dict(decision, target_session_id=target_id,
                             target_slug=live.get("slug"))
         else:
@@ -97,7 +96,7 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
             try:
                 created = backend.get_session(slug)
                 if created and created.get("session_id"):
-                    deliver_id = created["session_id"]
+                    backend_session_id = created["session_id"]
             except Exception:  # noqa: BLE001
                 pass
     if not target_id:
@@ -124,7 +123,7 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
     # 4. Seat handling: live-held-by-other + recent ledger activity => busy.
     try:
         try:
-            catalog.acquire_seat(session["slug"], holder)
+            session = catalog.acquire_seat(session["slug"], holder)
         except SeatError:
             if _session_busy(session, ledger):
                 return {**base, "result": "parked-busy",
@@ -140,6 +139,15 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
                 "reason": "seat-unavailable",
                 "target_session_id": target_id}
 
+    # Preserve the backend's identifier across later dispatches. Routing
+    # and ledger keys continue to use the catalog's stable identifier.
+    if backend_session_id and \
+            session.get("backend_session_id") != backend_session_id:
+        session = catalog.update_session(
+            session["slug"], session["revision"], holder=holder,
+            extra={"backend_session_id": backend_session_id})
+    deliver_id = session.get("backend_session_id") or target_id
+
     # 5. Ledger idempotency before any side effect.
     key = idempotency_key(message["canonical_hash"], target_id)
     existing = ledger.get(key)
@@ -151,8 +159,7 @@ def dispatch(message, decision, catalog, ledger, backend, holder="courier",
 
     # 6. Deliver via backend; typed backend errors => provider-fallback mark.
     try:
-        backend.append_message(deliver_id if kind == "NEW" else target_id,
-                               message)
+        backend.append_message(deliver_id, message)
     except Exception as e:  # noqa: BLE001 — adapter raises typed errors
         status, stored = ledger.record({
             "idempotency_key": key,

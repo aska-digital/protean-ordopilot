@@ -46,7 +46,8 @@ class State:
         try:
             for s in self.catalog().list_sessions():
                 b.seed(s["slug"], s.get("summary", ""),
-                       session_id=s["session_id"])
+                       session_id=s.get("backend_session_id") or
+                       s["session_id"])
         except Exception:  # noqa: BLE001 — projection may not exist yet
             pass
         return b
